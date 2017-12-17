@@ -84,7 +84,6 @@ rel_time_t realtime(time_t exptime) {
     }
 }
 
-
 /*
  * Reallocates memory and updates a buffer size if successful.
  */
@@ -125,10 +124,6 @@ void conn_shrink(conn *c) {
 */
 }
 
-void complete_nread(conn *c) {
-
-}
-
 void conn_set_state(conn *c, int state) {
     if (state != c->state) {
         if (state == conn_read) {
@@ -136,6 +131,131 @@ void conn_set_state(conn *c, int state) {
         }
         c->state = state;
     }
+}
+
+void out_string(conn *c, char *str) {
+    int len;
+
+    if (settings.verbose > 1)
+        fprintf(stderr, ">%d %s\n", c->sfd, str);
+
+    len = strlen(str);
+    if (len + 2 > c->wsize) {
+        /* ought to be always enough. just fail for simplicity */
+        str = "SERVER_ERROR output line too long";
+        len = strlen(str);
+    }
+
+    strcpy(c->wbuf, str);
+    strcpy(c->wbuf + len, "\r\n");
+    c->wbytes = len + 2;
+    c->wcurr = c->wbuf;
+
+    conn_set_state(c, conn_write);
+    c->write_and_go = conn_read;
+    return;
+}
+
+int item_delete_lock_over (item *it) {
+    assert(it->it_flags & ITEM_DELETED);
+    return (current_time >= it->exptime);
+}
+
+/* wrapper around assoc_find which does the lazy expiration/deletion logic */
+item *get_item_notedeleted(char *key, int *delete_locked) {
+    item *it = assoc_find(key);
+    if (delete_locked) *delete_locked = 0;
+    if (it && (it->it_flags & ITEM_DELETED)) {
+        if (! item_delete_lock_over(it)) {
+            if (delete_locked) *delete_locked = 1;
+            it = 0;
+        }
+    }
+    if (it && settings.oldest_live && settings.oldest_live <= current_time &&
+        it->time <= settings.oldest_live) {
+        item_unlink(it);
+        it = 0;
+    }
+    if (it && it->exptime && it->exptime <= current_time) {
+        item_unlink(it);
+        it = 0;
+    }
+
+    return it;
+}
+
+void conn_cleanup(conn *c) {
+    if (c->item) {
+        item_free(c->item);
+        c->item = 0;
+    }
+
+}
+
+void conn_close(conn *c) {
+    event_del(&c->event);
+
+    if (settings.verbose > 1)
+        fprintf(stderr, "<%d connection closed.\n", c->sfd);
+
+    close(c->sfd);
+    conn_cleanup(c);
+
+}
+
+void complete_nread(conn *c) {
+    item *it = c->item;
+    int comm = c->item_comm;
+    item *old_it;
+    int delete_locked = 0;
+    char *key = ITEM_key(it);
+
+    stats.set_cmds++;
+
+    if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) != 0) {
+        out_string(c, "CLIENT_ERROR bad data chunk");
+        goto err;
+    }
+
+    old_it = get_item_notedeleted(key, &delete_locked);
+
+    if (old_it && comm == NREAD_ADD) {
+        item_update(old_it);
+        out_string(c, "NOT_STORED");
+        goto err;
+    }
+
+    if (!old_it && comm == NREAD_REPLACE) {
+        out_string(c, "NOT_STORED");
+        goto err;
+    }
+
+    if (delete_locked) {
+        if (comm == NREAD_REPLACE || comm == NREAD_ADD) {
+            out_string(c, "NOT_STORED");
+            goto err;
+        }
+
+        /* but "set" commands can override the delete lock
+         window... in which case we have to find the old hidden item
+         that's in the namespace/LRU but wasn't returned by
+         get_item.... because we need to replace it (below) */
+        old_it = assoc_find(key);
+    }
+
+    if (old_it)
+        item_replace(old_it, it);
+    else
+        item_link(it);
+
+    c->item = 0;
+    out_string(c, "STORED");
+    return;
+
+err:
+     item_free(it);
+     c->item = 0;
+     return;
 }
 
 int update_event(conn *c, int new_flags) {
@@ -222,11 +342,6 @@ void stats_init(void) {
     stats.bytes_read = 0;
 }
 
-void out_string(conn *c, char *str) {
-
-}
-
-
 conn* conn_new(int sfd, int init_state, int event_flags, int read_buffer_size) {
     conn *c;
 
@@ -252,6 +367,8 @@ conn* conn_new(int sfd, int init_state, int event_flags, int read_buffer_size) {
 
         c->rbuf = (char *) malloc(c->rsize);
         c->wbuf = (char *) malloc(c->wsize);
+        c->ilist = (item **) malloc(sizeof(item *) * c->isize);
+        c->iov = (struct iovec *) malloc(sizeof(struct iovec) * c->iovsize);
         c->msglist = (struct msghdr *) malloc(sizeof(struct msghdr) * c->msgsize);
 
         if (c->rbuf == 0 || c->wbuf == 0 ||
@@ -318,6 +435,78 @@ conn* conn_new(int sfd, int init_state, int event_flags, int read_buffer_size) {
     return c;
 }
 
+int add_msghdr(conn *c)
+{
+    struct msghdr *msg;
+
+    if (c->msgsize == c->msgused) {
+        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
+        if (! msg)
+            return -1;
+        c->msglist = msg;
+        c->msgsize *= 2;
+    }
+
+    msg = c->msglist + c->msgused;
+
+    memset(msg, 0, sizeof(struct msghdr));
+
+    msg->msg_iov = &c->iov[c->iovused];
+    msg->msg_name = &c->request_addr;
+    msg->msg_namelen = c->request_addr_size;
+
+    c->msgbytes = 0;
+    c->msgused++;
+
+    return 0;
+}
+
+int ensure_iov_space(conn *c) {
+    if (c->iovused >= c->iovsize) {
+        int i, iovnum;
+        struct iovec *new_iov = (struct iovec *) realloc(c->iov,
+                                (c->iovsize * 2) * sizeof(struct iovec));
+        if (! new_iov)
+            return -1;
+        c->iov = new_iov;
+        c->iovsize *= 2;
+
+        for (i = 0, iovnum = 0; i < c->msgused; i++) {
+            c->msglist[i].msg_iov = &c->iov[iovnum];
+            iovnum += c->msglist[i].msg_iovlen;
+        }
+    }
+    return 0;
+}
+
+int add_iov(conn *c, const void *buf, int len) {
+    struct msghdr *m;
+    int i;
+
+    m = &c->msglist[c->msgused - 1];
+
+    if (m->msg_iovlen == IOV_MAX) {
+        add_msghdr(c);
+        m = &c->msglist[c->msgused - 1];
+    }
+
+    if (ensure_iov_space(c))
+        return -1;
+
+    m = &c->msglist[c->msgused - 1];
+
+    m->msg_iov[m->msg_iovlen].iov_base = (void*) buf;
+    m->msg_iov[m->msg_iovlen].iov_len = len;
+
+    c->msgbytes += len;
+    c->iovused++;
+    m->msg_iovlen++;
+
+    buf = ((char *)buf) + len;
+
+    return 0;
+}
+
 void drive_machine(conn *c) {
     int exit = 0;
     int sfd, flags = 1;
@@ -376,7 +565,6 @@ void drive_machine(conn *c) {
                 complete_nread(c);
                 break;
             }
-
             if (c->rbytes > 0) {
                 int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
                 memcpy(c->ritem, c->rcurr, tocopy);
@@ -398,7 +586,7 @@ void drive_machine(conn *c) {
                 conn_set_state(c, conn_closing);
                 break;
             }
-            if(res==-1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if(res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if(!update_event(c, EV_READ | EV_PERSIST)) {
                     if (settings.verbose > 0)
                         fprintf(stderr, "Couldn't update event\n");
@@ -415,8 +603,18 @@ void drive_machine(conn *c) {
 
         case conn_swallow:
             break;
+        case conn_write:
+            if (c->iovused == 0) {
+                if (add_iov(c, c->wcurr, c->wbytes)) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Couldn't build response\n");
+                    conn_set_state(c, conn_closing);
+                    break;
+                }
+            }
         case conn_closing:
-            printf("conn_closing\n");
+            conn_close(c);
+            exit = 1;
             break;
         }
     }
@@ -463,33 +661,6 @@ int try_read_command(conn *c) {
     c->rcurr = cont;
 
     return 1;
-}
-
-int add_msghdr(conn *c)
-{
-    struct msghdr *msg;
-
-    if(c->msgused == c->msgsize) {
-        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
-        if(!msg)
-            return -1;
-        c->msglist = msg;
-        c->msgsize *= 2;
-    }
-
-    msg = c->msglist + c->msgused;
-
-    memset(msg, 0, sizeof(struct msghdr));
-
-    msg->msg_iov = &c->iov[c->iovused];
-    msg->msg_name = &c->request_addr;
-    msg->msg_namelen = c->request_addr_size;
-
-    c->msgbytes = 0;
-    c->msgused++;
-
-
-    return 0;
 }
 
 void process_command(conn *c, char *command) {
@@ -681,6 +852,7 @@ int main(int argc, char **argv) {
     stats_init();
     conn_init();
     item_init();
+    assoc_init();
     slabs_init(settings.maxbytes, settings.factor);
 
     if(!conn_new(l_socket, conn_listening, EV_READ | EV_PERSIST, 1)) {

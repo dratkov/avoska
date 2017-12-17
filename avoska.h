@@ -22,9 +22,34 @@ struct settings
 	int port;
 	struct in_addr interface;
 	int verbose;
+    rel_time_t oldest_live;
 	int chunk_size;
 	double factor;
 };
+
+#define ITEM_LINKED 1
+#define ITEM_DELETED 2
+
+/* temp */
+#define ITEM_SLABBED 4
+
+typedef struct _stritem {
+    struct _stritem *next;
+    struct _stritem *prev;
+    struct _stritem *h_next;    /* hash chain next */
+    rel_time_t      time;       /* least recent access */
+    rel_time_t      exptime;    /* expire time */
+    int             nbytes;     /* size of data */
+    unsigned short  refcount;
+    unsigned char   nsuffix;    /* length of flags-and-length string */
+    unsigned char   it_flags;   /* ITEM_* above */
+    unsigned char   slabs_clsid;/* which slab class we're in */
+    unsigned char   nkey;       /* key length, w/terminating null and padding */
+    void * end[0];
+    /* then null-terminated key */
+    /* then " flags length\r\n" (no terminating null) */
+    /* then data with terminating \r\n (no terminating null; it's binary!) */
+} item;
 
 typedef struct {
     int    sfd;
@@ -73,7 +98,9 @@ typedef struct {
     int    msgcurr;   /* element in msglist[] being transmitted now */
     int    msgbytes;  /* number of bytes in current msg */
 
+    item   **ilist;
     int    isize;
+    item   **icurr;
     int    ileft;
 
     /* data for UDP clients */
@@ -104,37 +131,16 @@ enum conn_states {
 #define NREAD_REPLACE 3
 
 struct stats {
+    unsigned int  curr_items;
+    unsigned int  total_items;
 	time_t        started;          /* when the process was started */
 	unsigned int  curr_conns;
     unsigned int  total_conns;
+    unsigned long long curr_bytes;
 	unsigned int  conn_structs;
     unsigned long long bytes_read;
-
+    unsigned long long  set_cmds;
 };
-
-#define ITEM_LINKED 1
-#define ITEM_DELETED 2
-
-/* temp */
-#define ITEM_SLABBED 4
-
-typedef struct _stritem {
-    struct _stritem *next;
-    struct _stritem *prev;
-    struct _stritem *h_next;    /* hash chain next */
-    rel_time_t      time;       /* least recent access */
-    rel_time_t      exptime;    /* expire time */
-    int             nbytes;     /* size of data */
-    unsigned short  refcount;
-    unsigned char   nsuffix;    /* length of flags-and-length string */
-    unsigned char   it_flags;   /* ITEM_* above */
-    unsigned char   slabs_clsid;/* which slab class we're in */
-    unsigned char   nkey;       /* key length, w/terminating null and padding */
-    void * end[0];
-    /* then null-terminated key */
-    /* then " flags length\r\n" (no terminating null) */
-    /* then data with terminating \r\n (no terminating null; it's binary!) */
-} item;
 
 #define ITEM_key(item) ((char*)&((item)->end[0]))
 
@@ -156,12 +162,26 @@ unsigned int slabs_clsid(size_t size);
 /* event handling, network IO */
 void event_handler(int fd, short which, void *arg);
 conn *conn_new(int sfd, int init_state, int event_flags, int read_buffer_size);
+void conn_close(conn *c);
 int try_read_command(conn *c);
 void process_command(conn *c, char *command);
 int try_read_network(conn *c);
 int add_msghdr(conn *c);
+int add_iov(conn *c, const void *buf, int len);
 item *item_alloc(char *key, int flags, rel_time_t exptime, int nbytes);
 void item_init(void);
+void item_free(item *it);
+void item_update(item *it);   /* update LRU time to current and reposition */
+void item_unlink(item *it);
+int item_replace(item *it, item *new_it);
+int item_link(item *it);
+
+int ensure_iov_space(conn *c);
+
 void complete_nread(conn *c);
+void assoc_init(void);
+item *assoc_find(char *key);
+void assoc_delete(char *key);
+int assoc_insert(char *key, item *item);
 
 
