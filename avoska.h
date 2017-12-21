@@ -11,6 +11,9 @@
 
 /* High water marks for buffer shrinking */
 #define READ_BUFFER_HIGHWAT 8192
+#define ITEM_LIST_HIGHWAT 400
+#define IOV_LIST_HIGHWAT 600
+#define MSG_LIST_HIGHWAT 100
 
 /* Time relative to server start. Smaller than time_t on 64-bit systems. */
 typedef unsigned int rel_time_t;
@@ -23,6 +26,7 @@ struct settings
 	struct in_addr interface;
 	int verbose;
     rel_time_t oldest_live;
+    char *socketpath;
 	int chunk_size;
 	double factor;
 };
@@ -139,7 +143,11 @@ struct stats {
     unsigned long long curr_bytes;
 	unsigned int  conn_structs;
     unsigned long long bytes_read;
+    unsigned long long  get_cmds;
     unsigned long long  set_cmds;
+    unsigned long long  get_hits;
+    unsigned long long  get_misses;
+    unsigned long long bytes_written;
 };
 
 #define ITEM_key(item) ((char*)&((item)->end[0]))
@@ -175,6 +183,7 @@ void item_update(item *it);   /* update LRU time to current and reposition */
 void item_unlink(item *it);
 int item_replace(item *it, item *new_it);
 int item_link(item *it);
+void item_remove(item *it);
 
 int ensure_iov_space(conn *c);
 

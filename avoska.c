@@ -60,6 +60,10 @@ int l_socket=0;
 struct stats stats;
 struct settings settings;
 
+static item **todelete = 0;
+static int delcurr;
+static int deltotal;
+
 
 void settings_init( void ) {
     settings.port = 11211;
@@ -109,7 +113,6 @@ void conn_shrink(conn *c) {
     if (c->rsize > READ_BUFFER_HIGHWAT && c->rbytes < DATA_BUFFER_SIZE) {
        do_realloc((void **)&c->rbuf, DATA_BUFFER_SIZE, 1, &c->rsize);
     }
-/*
     if (c->isize > ITEM_LIST_HIGHWAT) {
         do_realloc((void **)&c->ilist, ITEM_LIST_INITIAL, sizeof(c->ilist[0]), &c->isize);
     }
@@ -121,7 +124,6 @@ void conn_shrink(conn *c) {
     if (c->iovsize > IOV_LIST_HIGHWAT) {
         do_realloc((void **)&c->iov, IOV_LIST_INITIAL, sizeof(c->iov[0]), &c->iovsize);
     }
-*/
 }
 
 void conn_set_state(conn *c, int state) {
@@ -184,12 +186,26 @@ item *get_item_notedeleted(char *key, int *delete_locked) {
     return it;
 }
 
+item *get_item(char *key) {
+    return get_item_notedeleted(key, 0);
+}
+
 void conn_cleanup(conn *c) {
     if (c->item) {
         item_free(c->item);
         c->item = 0;
     }
 
+    if (c->ileft) {
+        for (; c->ileft > 0; c->ileft--,c->icurr++) {
+            item_remove(*(c->icurr));
+        }
+    }
+
+    if (c->write_and_free) {
+        free(c->write_and_free);
+        c->write_and_free = 0;
+    }
 }
 
 void conn_close(conn *c) {
@@ -268,6 +284,57 @@ int update_event(conn *c, int new_flags) {
     return 1;
 }
 
+int transmit(conn *c) {
+
+    int res;
+
+    if (c->msgcurr < c->msgused &&
+            c->msglist[c->msgcurr].msg_iovlen == 0) {
+        c->msgcurr++;
+    }
+    if (c->msgcurr < c->msgused) {
+        struct msghdr *m = &c->msglist[c->msgcurr];
+
+        res = sendmsg(c->sfd, m, 0);
+
+        if(res > 0) {
+            stats.bytes_written += res;
+
+            while (m->msg_iovlen > 0 && res >= m->msg_iov->iov_len) {
+                res -= m->msg_iov->iov_len;
+                m->msg_iovlen--;
+                m->msg_iov++;
+            }
+
+            /* Might have written just part of the last iovec entry;
+               adjust it so the next write will do the rest. */
+            if (res > 0) {
+                m->msg_iov->iov_base += res;
+                m->msg_iov->iov_len -= res;
+            }
+            return TRANSMIT_INCOMPLETE;
+        }
+        if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!update_event(c, EV_WRITE | EV_PERSIST)) {
+                if (settings.verbose > 0)
+                    fprintf(stderr, "Couldn't update event\n");
+                conn_set_state(c, conn_closing);
+                return TRANSMIT_HARD_ERROR;
+            }
+            return TRANSMIT_SOFT_ERROR;
+        }
+
+        if (settings.verbose > 0)
+            perror("Failed to write, and not due to blocking");
+
+        conn_set_state(c, conn_closing);
+        return TRANSMIT_HARD_ERROR;
+    } else
+    {
+        return TRANSMIT_COMPLETE;
+    }
+}
+
 int new_socket() {
     int sfd;
     int flags;
@@ -339,7 +406,7 @@ void stats_init(void) {
     stats.curr_conns = stats.total_conns = stats.conn_structs = 0;
 
     stats.started = time(0) - 1;
-    stats.bytes_read = 0;
+    stats.bytes_read = stats.bytes_written = 0;
 }
 
 conn* conn_new(int sfd, int init_state, int event_flags, int read_buffer_size) {
@@ -502,7 +569,7 @@ int add_iov(conn *c, const void *buf, int len) {
     c->iovused++;
     m->msg_iovlen++;
 
-    buf = ((char *)buf) + len;
+    //buf = ((char *)buf) + len;
 
     return 0;
 }
@@ -545,7 +612,7 @@ void drive_machine(conn *c) {
             break;
         case conn_read:
             if(try_read_command(c)) {
-                //continue;
+                continue;
             }
 
             if(try_read_network(c)) {
@@ -612,6 +679,41 @@ void drive_machine(conn *c) {
                     break;
                 }
             }
+        case conn_mwrite:
+            switch(transmit(c)) {
+            case TRANSMIT_COMPLETE:
+                if(c->state == conn_mwrite) {
+                    while(c->ileft > 0) {
+                        item *it = *(c->icurr);
+                        assert((it->it_flags & ITEM_SLABBED) == 0);
+                        item_remove(it);
+                        c->icurr++;
+                        c->ileft--;
+                    }
+                    conn_set_state(c, conn_read);
+                } else if (c->state == conn_write) {
+                    if (c->write_and_free) {
+                        free(c->write_and_free);
+                        c->write_and_free = 0;
+                    }
+                    conn_set_state(c, c->write_and_go); 
+                } else {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Unexpected state %d\n", c->state);
+                    conn_set_state(c, conn_closing);
+                }
+                break;
+
+            case TRANSMIT_INCOMPLETE:
+            case TRANSMIT_HARD_ERROR:
+                break;                   /* Continue in state machine. */
+
+            case TRANSMIT_SOFT_ERROR:
+                exit = 1;
+                break;
+            }
+            break;
+
         case conn_closing:
             conn_close(c);
             exit = 1;
@@ -622,6 +724,10 @@ void drive_machine(conn *c) {
     return;
 }
 
+void process_stat(conn *c, char *command) {
+
+}
+
 void event_handler(int fd, short which, void *arg) {
     conn *c;
 
@@ -629,10 +735,8 @@ void event_handler(int fd, short which, void *arg) {
     c->which = which;
 
     if (fd != c->sfd) {
-        printf("close\n");
         return;
     }
-    printf("drive_machine %d\n", fd);
 
     /* do as much I/O as possible until we block */
     drive_machine(c);
@@ -704,6 +808,108 @@ void process_command(conn *c, char *command) {
         conn_set_state(c, conn_nread);
         return;
     }
+
+    if (strncmp(command, "get ", 4) == 0) {
+        char *start = command + 4;
+        char key[251];
+        int next;
+        int i;
+        item *it;
+        rel_time_t now;
+    get:
+        now = current_time;
+        i = 0;
+
+        while(sscanf(start, " %250s%n", key, &next) >= 1) {
+            start += next;
+            stats.get_cmds++;
+            it = get_item(key);
+            if(it) {
+                if (i >= c->isize) {
+                    item **new_list = realloc(c->ilist, sizeof(item *)*c->isize*2);
+                    if (new_list) {
+                        c->isize *= 2;
+                        c->ilist = new_list;
+                    } else break;
+                }
+
+                if(add_iov(c, "VALUE ", 6) ||
+                   add_iov(c, ITEM_key(it), strlen(ITEM_key(it))) ||
+                   add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes)) {
+                    break;
+                }
+                if (settings.verbose > 1)
+                    fprintf(stderr, ">%d sending key %s\n", c->sfd, ITEM_key(it));
+
+                stats.get_hits++;
+                it->refcount++;
+                item_update(it);
+                *(c->ilist + i) = it;
+                i++;
+            } else stats.get_misses++;
+        }
+
+        c->icurr = c->ilist;
+        c->ileft = i;
+
+        if (settings.verbose > 1)
+            fprintf(stderr, ">%d END\n", c->sfd);
+        add_iov(c, "END\r\n", 5);
+
+        conn_set_state(c, conn_mwrite);
+        c->msgcurr = 0;
+
+        return;
+    }
+
+    if (strncmp(command, "delete ", 7) == 0) {
+        char key[251];
+        item *it;
+        int res;
+        time_t exptime = 0;
+
+        res = sscanf(command, "%*s %250s %ld", key, &exptime);
+        it = get_item(key);
+        if (!it) {
+            out_string(c, "NOT_FOUND");
+            return;
+        }
+        if (exptime == 0) {
+            item_unlink(it);
+            out_string(c, "DELETED");
+            return;
+        }
+        if (delcurr >= deltotal) {
+            item **new_delete = realloc(todelete, sizeof(item *) * deltotal * 2);
+            if (new_delete) {
+                todelete = new_delete;
+                deltotal *= 2;
+            } else {
+                /*
+                 * can't delete it immediately, user wants a delay,
+                 * but we ran out of memory for the delete queue
+                 */
+                out_string(c, "SERVER_ERROR out of memory");
+                return;
+            }
+        }
+
+        it->refcount++;
+        /* use its expiration time as its deletion time now */
+        it->exptime = realtime(exptime);
+        it->it_flags |= ITEM_DELETED;
+        todelete[delcurr++] = it;
+        out_string(c, "DELETED");
+        return;
+    }
+
+    if (strncmp(command, "stats", 5) == 0) {
+        process_stat(c, command);
+        return;
+    }
+
+    out_string(c, "ERROR");
+    return;
 }
 
 int try_read_network(conn *c) {
@@ -729,6 +935,12 @@ int try_read_network(conn *c) {
             }
             c->rcurr = c->rbuf = new_buf;
             c->rsize *= 2;
+        }
+
+        if (!settings.socketpath) {
+            c->request_addr_size = sizeof(c->request_addr);
+        } else {
+            c->request_addr_size = 0;
         }
 
         res = read(c->sfd, c->rbuf + c->rbytes, c->rsize - c->rbytes);
@@ -768,6 +980,23 @@ void delete_handler(int fd, short which, void *arg) {
     evtimer_set(&deleteevent, delete_handler, 0);
     t.tv_sec = 5; t.tv_usec=0;
     evtimer_add(&deleteevent, &t);
+
+    {
+        int i, j = 0;
+        rel_time_t now = current_time;
+        for(i = 0; i < delcurr; i++) {
+            item *it = todelete[i];
+            if (item_delete_lock_over(it)) {
+                assert(it->refcount > 0);
+                it->it_flags &= ~ITEM_DELETED;
+                item_unlink(it);
+                item_remove(it);
+            } else {
+                todelete[j++] = it;
+            }
+        }
+        delcurr = j;
+    }
 }
 
 volatile rel_time_t current_time;
@@ -861,6 +1090,9 @@ int main(int argc, char **argv) {
     }
 
     clock_handler(0, 0, 0);
+
+    deltotal = 200; delcurr = 0;
+    todelete = malloc(sizeof(item *)*deltotal);
 
     delete_handler(0,0,0);
 

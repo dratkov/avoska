@@ -29,7 +29,7 @@ int item_make_header(char *key, int flags, int nbytes,
     *keylen = strlen(key + 1);
     if(*keylen % 4)
         *keylen += 4 - (*keylen % 4);
-    *nsuffix = sprintf(sufficx, "%u %u\r\n", flags, nbytes);
+    *nsuffix = sprintf(sufficx, " %u %u\r\n", flags, nbytes - 2);
     return sizeof(item) + *keylen + *nsuffix + nbytes;
 }
 
@@ -86,6 +86,15 @@ void item_link_q(item *it) {
 
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
+    assert(it != *head);
+    assert((*head && *tail) || (*head == 0 && *tail == 0));
+    it->prev = 0;
+    it->next = *head;
+    if (it->next) it->next->prev = it;
+    *head = it;
+    if (*tail == 0) *tail = it;
+    sizes[it->slabs_clsid]++;
+    return;
 }
 
 void item_free(item *it) {
@@ -132,5 +141,14 @@ int item_link(item *it) {
     item_link_q(it);
 
     return 1;
+}
+
+void item_remove(item *it) {
+    assert((it->it_flags & ITEM_SLABBED) == 0);
+    if (it->refcount) it->refcount--;
+    assert((it->it_flags & ITEM_DELETED) == 0 || it->refcount);
+    if (it->refcount == 0 && (it->it_flags & ITEM_LINKED) == 0) {
+        item_free(it);
+    }
 }
 
