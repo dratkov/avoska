@@ -1,4 +1,4 @@
 Avoska
 ======
 
-High-performace nn-memory caching system.
+High-performace in-memory caching system.
